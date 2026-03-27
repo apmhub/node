@@ -36,14 +36,19 @@ func main() {
 
 	fmt.Println(string(data))
 
+	var machineID int
 	if !strings.HasSuffix(si.Node.Hostname, ".armhub.local") {
-		err = CreateMachine(si, url)
+		machineID, err = CreateMachine(si, url)
 		if err != nil {
 			fmt.Println("Error creating machine:", err)
 		}
+
+		// TODO установка хостнейма
+	} else {
+		// TODO получение ID по хостнейму
 	}
 
-	err = CreateMetric(si, url)
+	err = CreateMetric(machineID, si, url)
 	if err != nil {
 		fmt.Println("Error creating metric:", err)
 	}
@@ -51,7 +56,7 @@ func main() {
 
 // Функции епто
 
-func CreateMachine(si sysinfo.SysInfo, url string) error {
+func CreateMachine(si sysinfo.SysInfo, url string) (int, error) {
 	var disks []int
 	for i := range si.Storage {
 		disks = append(disks, int(si.Storage[i].Size))
@@ -72,14 +77,14 @@ func CreateMachine(si sysinfo.SysInfo, url string) error {
 
 	err := json.NewDecoder(resp.Body).Decode(&result)
 	if err != nil {
-		return fmt.Errorf("error decode response: %s", err)
+		return 0, fmt.Errorf("error decode response: %s", err)
 	}
 
 	fmt.Printf("Machine created: ID=%d, Hostname=%s\n", result.ID, result.Hostname)
-	return nil
+	return int(result.ID), nil
 }
 
-func CreateMetric(si sysinfo.SysInfo, url string) error {
+func CreateMetric(machineID int, si sysinfo.SysInfo, url string) error {
 	// TODO
 	return nil
 }
@@ -133,7 +138,7 @@ type Metric struct {
 	CpuLoad      float32  `json:"cpu_load" db:"cpu_load"`
 	FreeMemoryMB int      `json:"free_memory_mb" db:"free_memory_mb"`
 	DiskFreeGB   int      `json:"disk_free_gb" db:"disk_free_gb"`
-	CurrentUser  string   `json:"current_user" db:"current_user"`
+	ActiveUser   string   `json:"active_user" db:"active_user"`
 	MountedDisks []string `json:"mounted_disks" db:"mounted_disks"`
 	CreatedAt    string   `json:"created_at" db:"created_at"`
 }
