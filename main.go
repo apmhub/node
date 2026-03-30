@@ -5,9 +5,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"log"
 	"math"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"strconv"
@@ -18,36 +19,42 @@ import (
 
 func main() {
 	url := os.Getenv("API_URL")
+	domain := os.Getenv("DOMAIN")
+	fmt.Printf("url: %s, domain: %s\n", url, domain)
 
 	var si sysinfo.SysInfo
 
 	si.GetSysInfo()
-	//fmt.Println(si.)
-	data, err := json.MarshalIndent(&si, "", "  ")
-	if err != nil {
-		log.Fatal(err)
-	}
 
-	fmt.Println(string(data))
-
-	var machineID int
-	err = CreateMetric(machineID, si, url)
-	if err != nil {
-		fmt.Println("Error creating metric:", err)
-	}
-	return
-	if !strings.HasSuffix(si.Node.Hostname, ".armhub.local") {
-		machineID, err = CreateMachine(si, url)
+	var machineID int64
+	if !strings.HasSuffix(si.Node.Hostname, "."+domain) {
+		machine, err := CreateMachine(si, url)
 		if err != nil {
 			fmt.Println("Error creating machine:", err)
 		}
 
-		// TODO установка хостнейма
+		machineID = machine.ID
+		//machine.Hostname = fmt.Sprintf("%s.%s", machine.Hostname, domain)
+		//
+		//_, err = exec.Command("sh", "-c", fmt.Sprintf("hostnamectl set-hostname %s", machine.Hostname)).Output()
+		//
+		//if err != nil {
+		//	fmt.Printf("%s", err)
+		//	return
+		//}
 	} else {
-		// TODO получение ID по хостнейму
+		var err error
+		machineID, err = GetMachineIDByHostname(si.Node.Hostname, url)
+		if err != nil {
+			fmt.Println("Error getting id by hostname:", err)
+		}
+	}
+	if machineID == 0 {
+		fmt.Println("id = 0")
+		return
 	}
 
-	err = CreateMetric(machineID, si, url)
+	err := CreateMetric(machineID, si, url)
 	if err != nil {
 		fmt.Println("Error creating metric:", err)
 	}
@@ -55,46 +62,71 @@ func main() {
 
 // Функции епто
 
-func CreateMachine(si sysinfo.SysInfo, url string) (int, error) {
-	var disks []int
+func CreateMachine(si sysinfo.SysInfo, url string) (*MachineCreateResponse, error) {
+	var totalDisk int
 	for i := range si.Storage {
-		disks = append(disks, int(si.Storage[i].Size))
+		totalDisk += int(si.Storage[i].Size)
+	}
+	ip, mac, err := GetIPAndMAC()
+	if err != nil {
+		fmt.Println("error:", err)
+		return nil, fmt.Errorf("error getting IP and MAC: %w", err)
 	}
 	m := Machine{
-		IP:     "TODO",
+		IP:     ip,
+		MAC:    mac,
 		Prefix: "TODO",
 		CPU:    si.CPU.Model,
 		RamGB:  int(si.Memory.Size) / 1024,
-		DiskGB: disks,
+		DiskGB: totalDisk,
 	}
-	fmt.Println(m)
 
 	url += "/machine"
 	resp := Request(m, url)
 
 	var result MachineCreateResponse
 
-	err := json.NewDecoder(resp.Body).Decode(&result)
+	err = json.NewDecoder(resp.Body).Decode(&result)
 	if err != nil {
-		return 0, fmt.Errorf("error decode response: %s", err)
+		return nil, fmt.Errorf("error decode response: %s", err)
 	}
+	defer resp.Body.Close()
 
 	fmt.Printf("Machine created: ID=%d, Hostname=%s\n", result.ID, result.Hostname)
-	return int(result.ID), nil
+	return &result, nil
 }
 
-func CreateMetric(machineID int, si sysinfo.SysInfo, url string) error {
+func CreateMetric(machineID int64, si sysinfo.SysInfo, url string) error {
 	freeMemMB, _ := GetFreeMemoryMB()
 	cpuUsage, _ := GetCPUUsage()
 	freeDiskGB, _ := GetDiskFreeGB()
 	user, _ := GetLoggedInUser()
 	uptime, _ := GetUptime()
 
-	fmt.Println("Free RAM (MB):", freeMemMB)
-	fmt.Println("CPU Usage (%):", cpuUsage)
-	fmt.Println("Free Disk (GB):", freeDiskGB)
-	fmt.Println("Logged user:", user)
-	fmt.Println("Uptime (sec):", uptime)
+	m := Metric{
+		MachineID:    machineID,
+		Uptime:       uptime,
+		CpuLoad:      cpuUsage,
+		FreeMemoryMB: freeMemMB,
+		DiskFreeGB:   freeDiskGB,
+		ActiveUser:   user,
+		MountedDisks: []string{},
+	}
+
+	url += "/metrics"
+	resp := Request(m, url)
+	if resp == nil {
+		return fmt.Errorf("error resp is nil")
+	}
+	var result ID
+
+	err := json.NewDecoder(resp.Body).Decode(&result)
+	if err != nil {
+		return fmt.Errorf("error decode response: %s", err)
+	}
+	defer resp.Body.Close()
+
+	fmt.Printf("Metric created: ID=%d\n", result.ID)
 
 	return nil
 }
@@ -117,7 +149,6 @@ func Request(bodyData any, url string) *http.Response {
 		fmt.Println("error sending request:", err)
 		return nil
 	}
-	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		fmt.Println("unexpected status:", resp.Status)
@@ -127,14 +158,47 @@ func Request(bodyData any, url string) *http.Response {
 	return resp
 }
 
+func GetMachineIDByHostname(hostname, apiURL string) (int64, error) {
+	// формируем URL
+	u, err := url.Parse(apiURL + "/machine/id")
+	if err != nil {
+		return 0, err
+	}
+
+	query := u.Query()
+	query.Set("hostname", hostname)
+	u.RawQuery = query.Encode()
+
+	// отправка запроса
+	resp, err := http.Get(u.String())
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("bad status: %s", resp.Status)
+	}
+
+	// парсинг ответа
+	var result ID
+	err = json.NewDecoder(resp.Body).Decode(&result)
+	if err != nil {
+		return 0, err
+	}
+
+	return result.ID, nil
+}
+
 // Сущности нахуй
 
 type Machine struct {
 	IP     string `json:"ip" db:"ip"`
+	MAC    string `json:"mac" db:"mac"`
 	Prefix string `json:"prefix" db:"prefix"`
 	CPU    string `json:"cpu" db:"cpu"`
 	RamGB  int    `json:"ram_gb" db:"ram_gb"`
-	DiskGB []int  `json:"disk_gb" db:"disk_gb"`
+	DiskGB int    `json:"disk_gb" db:"disk_gb"`
 }
 
 type MachineCreateResponse struct {
@@ -150,6 +214,47 @@ type Metric struct {
 	DiskFreeGB   int      `json:"disk_free_gb" db:"disk_free_gb"`
 	ActiveUser   string   `json:"active_user" db:"active_user"`
 	MountedDisks []string `json:"mounted_disks" db:"mounted_disks"`
+}
+
+type ID struct {
+	ID int64 `json:"id"`
+}
+
+func GetIPAndMAC() (string, string, error) {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return "", "", err
+	}
+
+	for _, iface := range interfaces {
+		// пропускаем loopback и выключенные интерфейсы
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok {
+				continue
+			}
+
+			ip := ipNet.IP
+
+			// берём только IPv4
+			if ip == nil || ip.IsLoopback() || ip.To4() == nil {
+				continue
+			}
+
+			return ip.String(), iface.HardwareAddr.String(), nil
+		}
+	}
+
+	return "", "", fmt.Errorf("no active interface found")
 }
 
 func GetFreeMemoryMB() (int, error) {
@@ -176,7 +281,7 @@ func GetFreeMemoryMB() (int, error) {
 }
 
 // 🔥 2. CPU (% загрузки)
-func GetCPUUsage() (float64, error) {
+func GetCPUUsage() (float32, error) {
 	// читаем два раза /proc/stat
 	idle, total := readCPU()
 
@@ -184,7 +289,7 @@ func GetCPUUsage() (float64, error) {
 		return 0, nil
 	}
 
-	usage := math.Round((1.0-float64(idle)/float64(total))*100*100) / 100
+	usage := float32(math.Round((1.0-float64(idle)/float64(total))*100*100) / 100)
 	return usage, nil
 }
 
@@ -241,7 +346,6 @@ func GetLoggedInUser() (string, error) {
 	lines := strings.Split(out.String(), "\n")
 
 	for _, line := range lines {
-		// ищем DISPLAY (:0)
 		if strings.Contains(line, ":0") {
 			fields := strings.Fields(line)
 			return fields[0], nil
