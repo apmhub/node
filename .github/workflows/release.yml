@@ -92,3 +92,79 @@ jobs:
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  notify:
+    name: Send notification
+    runs-on: ubuntu-latest
+    needs: release
+    if: always() && startsWith(github.ref, 'refs/tags/')
+    permissions:
+      actions: read
+
+    steps:
+      - name: Collect build info
+        id: info
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          jobs_json=$(curl -s \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs?per_page=100")
+
+          build_time=$(jq -r '
+            .jobs[]
+            | select(.name | startswith("Build "))
+            | ((.completed_at // now) | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) -
+              ((.started_at)          | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime)
+          ' <<<"$jobs_json" 2>/dev/null | awk '{s+=$1} END {print s+0}')
+
+          echo "build_time=$build_time" >> $GITHUB_OUTPUT
+
+      - name: Notify success
+        if: needs.release.result == 'success'
+        uses: containrrr/shoutrrr-action@v1
+        with:
+          url: ${{ secrets.TELEGRAM_URL }}
+          message: |
+            ✅ Новый релиз опубликован
+            Репозиторий: ${{ github.repository }}
+            Тег: ${{ github.ref_name }}
+            Коммит: ${{ github.sha }}
+            Автор: ${{ github.actor }}
+
+            ⏱ Время сборки: ${{ steps.info.outputs.build_time }} сек
+
+            🔗 ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ github.ref_name }}
+
+      - name: Notify failure
+        if: needs.release.result == 'failure'
+        uses: containrrr/shoutrrr-action@v1
+        with:
+          url: ${{ secrets.TELEGRAM_URL }}
+          message: |
+            ❌ Ошибка при сборке или публикации релиза
+            Репозиторий: ${{ github.repository }}
+            Тег: ${{ github.ref_name }}
+            Коммит: ${{ github.sha }}
+            Автор: ${{ github.actor }}
+
+            ⏱ Время до ошибки: ${{ steps.info.outputs.build_time }} сек
+
+            🔗 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Notify cancelled
+        if: needs.release.result == 'cancelled'
+        uses: containrrr/shoutrrr-action@v1
+        with:
+          url: ${{ secrets.TELEGRAM_URL }}
+          message: |
+            ⚠️ Релиз отменён
+            Репозиторий: ${{ github.repository }}
+            Тег: ${{ github.ref_name }}
+            Коммит: ${{ github.sha }}
+            Автор: ${{ github.actor }}
+
+            ⏱ Время до отмены: ${{ steps.info.outputs.build_time }} сек
+
+            🔗 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
