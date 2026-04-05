@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"github.com/joho/godotenv"
 	"log"
 	"math"
 	"net"
@@ -17,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/joho/godotenv"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/zcalusic/sysinfo"
@@ -40,6 +40,70 @@ var (
 		Name: "node_uptime_seconds",
 		Help: "System uptime in seconds",
 	})
+
+	// CPU breakdown
+	cpuUser = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_cpu_user_percent",
+		Help: "CPU user time percent",
+	})
+	cpuSystem = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_cpu_system_percent",
+		Help: "CPU system time percent",
+	})
+	cpuIowait = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_cpu_iowait_percent",
+		Help: "CPU iowait time percent",
+	})
+	cpuIrq = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_cpu_irq_percent",
+		Help: "CPU IRQ time percent (irq + softirq)",
+	})
+	cpuIdle = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_cpu_idle_percent",
+		Help: "CPU idle time percent",
+	})
+
+	// Memory breakdown
+	memTotal = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_memory_total_mb",
+		Help: "Total memory in MB",
+	})
+	memUsed = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_memory_used_mb",
+		Help: "Used memory in MB (total - available)",
+	})
+	memCacheBuffer = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_memory_cache_buffer_mb",
+		Help: "Cache + Buffers memory in MB",
+	})
+
+	// Swap
+	swapTotal = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_swap_total_mb",
+		Help: "Total swap in MB",
+	})
+	swapUsed = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_swap_used_mb",
+		Help: "Used swap in MB",
+	})
+
+	// Load average
+	loadAvg1 = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_load_average_1m",
+		Help: "Load average 1 minute",
+	})
+	loadAvg5 = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_load_average_5m",
+		Help: "Load average 5 minutes",
+	})
+	loadAvg15 = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_load_average_15m",
+		Help: "Load average 15 minutes",
+	})
+
+	// Previous CPU snapshot for delta calculation
+	prevCPUFields [10]uint64
+	prevCPUTotal  uint64
 )
 
 func main() {
@@ -62,7 +126,13 @@ func main() {
 	machineID := register(si, apiURL, domain)
 
 	// Поднимаем HTTP-сервер
-	prometheus.MustRegister(cpuUsage, memFree, diskFree, uptimeSeconds)
+	prometheus.MustRegister(
+		cpuUsage, memFree, diskFree, uptimeSeconds,
+		cpuUser, cpuSystem, cpuIowait, cpuIrq, cpuIdle,
+		memTotal, memUsed, memCacheBuffer,
+		swapTotal, swapUsed,
+		loadAvg1, loadAvg5, loadAvg15,
+	)
 
 	mux := newMux(machineID, si)
 	srv := newServer(port, mux)
@@ -114,19 +184,42 @@ func register(si sysinfo.SysInfo, apiURL, domain string) int64 {
 
 // collectMetrics обновляет Prometheus-метрики каждые 15 секунд.
 func collectMetrics() {
+	// Инициализируем предыдущий снимок CPU
+	initCPUSnapshot()
+
 	for {
-		if cpu, err := GetCPUUsage(); err == nil {
-			cpuUsage.Set(float64(cpu))
+		// CPU breakdown (delta между снимками)
+		if breakdown, err := GetCPUBreakdown(); err == nil {
+			cpuUsage.Set(breakdown.Usage)
+			cpuUser.Set(breakdown.User)
+			cpuSystem.Set(breakdown.System)
+			cpuIowait.Set(breakdown.Iowait)
+			cpuIrq.Set(breakdown.Irq)
+			cpuIdle.Set(breakdown.Idle)
 		}
-		if mem, err := GetFreeMemoryMB(); err == nil {
-			memFree.Set(float64(mem))
+
+		// Memory breakdown
+		if mi, err := GetMemoryInfo(); err == nil {
+			memTotal.Set(float64(mi.TotalMB))
+			memFree.Set(float64(mi.FreeMB))
+			memUsed.Set(float64(mi.UsedMB))
+			memCacheBuffer.Set(float64(mi.CacheBufferMB))
+			swapTotal.Set(float64(mi.SwapTotalMB))
+			swapUsed.Set(float64(mi.SwapUsedMB))
 		}
+
 		if disk, err := GetDiskFreeGB(); err == nil {
 			diskFree.Set(float64(disk))
 		}
 		if up, err := GetUptime(); err == nil {
 			uptimeSeconds.Set(float64(up))
 		}
+		if la, err := GetLoadAverage(); err == nil {
+			loadAvg1.Set(la[0])
+			loadAvg5.Set(la[1])
+			loadAvg15.Set(la[2])
+		}
+
 		time.Sleep(15 * time.Second)
 	}
 }
@@ -150,6 +243,7 @@ func newMux(machineID int64, si sysinfo.SysInfo) *http.ServeMux {
 			MAC:          mac,
 			MountedDisks: disks,
 			ActiveUser:   user,
+			OsName:       si.OS.Name,
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -193,6 +287,7 @@ func CreateMachine(si sysinfo.SysInfo, apiURL string) (*MachineCreateResponse, e
 		CPU:    si.CPU.Model,
 		RamGB:  int(si.Memory.Size) / 1024,
 		DiskGB: totalDisk,
+		OsName: si.OS.Name,
 	}
 
 	resp := Request(m, apiURL+"/machine")
@@ -271,6 +366,7 @@ type Machine struct {
 	CPU    string `json:"cpu"`
 	RamGB  int    `json:"ram_gb"`
 	DiskGB int    `json:"disk_gb"`
+	OsName string `json:"os_name"`
 }
 
 type MachineCreateResponse struct {
@@ -284,6 +380,7 @@ type InfoResponse struct {
 	MAC          string   `json:"mac"`
 	MountedDisks []string `json:"mounted_disks"`
 	ActiveUser   string   `json:"active_user"`
+	OsName       string   `json:"os_name"`
 }
 
 type ID struct {
@@ -322,50 +419,147 @@ func GetIPAndMAC() (string, string, error) {
 	return "", "", fmt.Errorf("no active interface found")
 }
 
-func GetFreeMemoryMB() (int, error) {
-	file, err := os.Open("/proc/meminfo")
+// ─── CPU Breakdown ───────────────────────────────────────────────────────
+
+// CPUBreakdown содержит процентное распределение CPU по категориям.
+type CPUBreakdown struct {
+	Usage  float64 // общая загрузка (100 - idle)
+	User   float64 // user + nice
+	System float64 // system
+	Iowait float64 // iowait
+	Irq    float64 // irq + softirq
+	Idle   float64 // idle + steal
+}
+
+// initCPUSnapshot делает начальный снимок /proc/stat.
+func initCPUSnapshot() {
+	fields := readCPUFields()
+	var total uint64
+	for i := 0; i < len(fields); i++ {
+		total += fields[i]
+	}
+	prevCPUFields = fields
+	prevCPUTotal = total
+}
+
+// readCPUFields считывает числовые поля первой строки /proc/stat.
+// Порядок: user(0) nice(1) system(2) idle(3) iowait(4) irq(5) softirq(6) steal(7) guest(8) guest_nice(9)
+func readCPUFields() [10]uint64 {
+	var fields [10]uint64
+	file, err := os.Open("/proc/stat")
 	if err != nil {
-		return 0, err
+		return fields
 	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.HasPrefix(line, "MemAvailable:") {
-			fields := strings.Fields(line)
-			kb, _ := strconv.Atoi(fields[1])
-			return kb / 1024, nil
-		}
-	}
-	return 0, fmt.Errorf("MemAvailable not found")
-}
-
-func GetCPUUsage() (float32, error) {
-	idle, total := readCPU()
-	if total == 0 {
-		return 0, nil
-	}
-	usage := float32(math.Round((1.0-float64(idle)/float64(total))*100*100) / 100)
-	return usage, nil
-}
-
-func readCPU() (idle, total uint64) {
-	file, _ := os.Open("/proc/stat")
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
 	scanner.Scan()
-	fields := strings.Fields(scanner.Text())
+	parts := strings.Fields(scanner.Text())
 
-	for i := 1; i < len(fields); i++ {
-		val, _ := strconv.ParseUint(fields[i], 10, 64)
-		total += val
-		if i == 4 {
-			idle = val
-		}
+	for i := 1; i < len(parts) && i <= 10; i++ {
+		val, _ := strconv.ParseUint(parts[i], 10, 64)
+		fields[i-1] = val
 	}
-	return
+	return fields
+}
+
+// GetCPUBreakdown возвращает дельту CPU с предыдущего вызова.
+func GetCPUBreakdown() (CPUBreakdown, error) {
+	cur := readCPUFields()
+	var curTotal uint64
+	for i := 0; i < len(cur); i++ {
+		curTotal += cur[i]
+	}
+
+	deltaTotal := float64(curTotal - prevCPUTotal)
+	if deltaTotal == 0 {
+		return CPUBreakdown{Idle: 100}, nil
+	}
+
+	d := func(idx int) float64 {
+		return float64(cur[idx]-prevCPUFields[idx]) / deltaTotal * 100
+	}
+
+	b := CPUBreakdown{
+		User:   math.Round((d(0)+d(1))*100) / 100,     // user + nice
+		System: math.Round(d(2)*100) / 100,              // system
+		Iowait: math.Round(d(4)*100) / 100,              // iowait
+		Irq:    math.Round((d(5)+d(6))*100) / 100,       // irq + softirq
+		Idle:   math.Round((d(3)+d(7))*100) / 100,       // idle + steal
+	}
+	b.Usage = math.Round((100-b.Idle)*100) / 100
+
+	prevCPUFields = cur
+	prevCPUTotal = curTotal
+
+	return b, nil
+}
+
+// ─── Memory Info ─────────────────────────────────────────────────────────
+
+// MemoryInfoResult содержит разбивку памяти.
+type MemoryInfoResult struct {
+	TotalMB       int
+	FreeMB        int // MemAvailable
+	UsedMB        int // Total - Available
+	CacheBufferMB int // Cached + Buffers
+	SwapTotalMB   int
+	SwapUsedMB    int // SwapTotal - SwapFree
+}
+
+func GetMemoryInfo() (MemoryInfoResult, error) {
+	file, err := os.Open("/proc/meminfo")
+	if err != nil {
+		return MemoryInfoResult{}, err
+	}
+	defer file.Close()
+
+	values := make(map[string]int)
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.Fields(line)
+		if len(parts) < 2 {
+			continue
+		}
+		key := strings.TrimSuffix(parts[0], ":")
+		kb, _ := strconv.Atoi(parts[1])
+		values[key] = kb
+	}
+
+	totalMB := values["MemTotal"] / 1024
+	availMB := values["MemAvailable"] / 1024
+	cachedMB := values["Cached"] / 1024
+	buffersMB := values["Buffers"] / 1024
+	swapTotalMB := values["SwapTotal"] / 1024
+	swapFreeMB := values["SwapFree"] / 1024
+
+	return MemoryInfoResult{
+		TotalMB:       totalMB,
+		FreeMB:        availMB,
+		UsedMB:        totalMB - availMB,
+		CacheBufferMB: cachedMB + buffersMB,
+		SwapTotalMB:   swapTotalMB,
+		SwapUsedMB:    swapTotalMB - swapFreeMB,
+	}, nil
+}
+
+// ─── Load Average ────────────────────────────────────────────────────────
+
+func GetLoadAverage() ([3]float64, error) {
+	data, err := os.ReadFile("/proc/loadavg")
+	if err != nil {
+		return [3]float64{}, err
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) < 3 {
+		return [3]float64{}, fmt.Errorf("invalid /proc/loadavg")
+	}
+	var la [3]float64
+	la[0], _ = strconv.ParseFloat(fields[0], 64)
+	la[1], _ = strconv.ParseFloat(fields[1], 64)
+	la[2], _ = strconv.ParseFloat(fields[2], 64)
+	return la, nil
 }
 
 func GetDiskFreeGB() (int, error) {
